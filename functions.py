@@ -2,10 +2,11 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from shapely.geometry import LineString
 from shapely.ops import polygonize
+import ezdxf
 
-def load_from_df(path):
+def load_from_dxf(path):
     # 1. Leer el archivo CAD directamente
-    doc = ezdxf.readfile(ruta_dxf)
+    doc = ezdxf.readfile(path)
     msp = doc.modelspace()
     
     lineas = []
@@ -14,7 +15,8 @@ def load_from_df(path):
     # (Funciona tanto para LWPOLYLINE como para POLYLINE tradicionales)
     for entity in msp.query('LWPOLYLINE[layer=="0-REPARCELACION"]'):
         # El truco: 'distance=0.05' le dice que aproxime las curvas con tramos rectos cada 5 cm
-        puntos = list(entity.flattening(distance=0.05))
+        ruta_objeto = ezdxf.path.make_path(entity)
+        puntos = list(ruta_objeto.flattening(distance=0.05))
         if len(puntos) > 1:
             # Creamos la geometría continua de la parcela completa
             # Sacamos tramos de dos puntos para alimentar el polygonize
@@ -26,19 +28,17 @@ def load_from_df(path):
     # 3. Cerrar los perímetros
     parcelas_poligonos = list(polygonize(lineas))
     print(f"Polígonos totales generados con éxito: {len(parcelas_poligonos)}")
+    return parcelas_poligonos
 
-def plot_graph(pandas_df):
+def plot_graph(parcelas_poligonos):
 
+# 4. Pintar plano final
     fig, ax = plt.subplots(figsize=(10, 10))
-
-    # Dibujamos las líneas una a una de forma independiente en color rojo
-    for index, row in pandas_df.iterrows():
-        if not pd.isna(row['Inicial X']):
-            x_coords = [row['Inicial X'], row['Fin X']]
-            y_coords = [row['Inicial Y'], row['Fin Y']]
-            ax.plot(x_coords, y_coords, color="red", linewidth=1.5)
-
+    for pol in parcelas_poligonos:
+        x, y = pol.exterior.xy
+        ax.plot(x, y, color="blue", linewidth=1)
+        ax.fill(x, y, color="lightblue", alpha=0.3)
+        
     ax.set_aspect('equal')
-    plt.title("Líneas en bruto desde el Excel (Sin agrupar)")
-    plt.grid(True, linestyle='--', alpha=0.5)
+    plt.title("Plano Completo de Parcelas con Snapping")
     plt.show()
