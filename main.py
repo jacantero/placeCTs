@@ -1,6 +1,6 @@
 from functions import *
 
-path = "16925-CMYPA-PLA-11.1-RedBajaTensionDisHojas-S2-00.xlsx"
+path = "16925-CMYPA-PLA-11.1-RedBajaTensionDisHojas-calles.xlsx"
 #Nos interesan las columnas de Capa, Posición x, Posición Y, Contenido, Inicio X, Inicio Y, Fin X y Fin Y. Hay que _explode las polilineas
 df = pd.read_excel(path)
 

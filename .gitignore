@@ -1,0 +1,12 @@
+# Ignorar-ho tot de base
+*
+
+# No ignorar els directoris (perquè Git pugui buscar a dins)
+!*/
+
+# No ignorar el propi fitxer .gitignore (opcional però recomanat)
+!.gitignore
+
+# Les teves excepcions: No ignorar fitxers .py ni .xlsx
+!*.py
+!*.xlsx

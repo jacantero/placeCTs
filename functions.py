@@ -14,7 +14,7 @@ def get_power(pandas_df):
         str_potencia = str(row['Contenido']).lower()
         if "kw" in str_potencia:
             potencia = str_potencia.split("kw")[0].strip()
-            position = [row['Posición X1'], row['Posición Y1']]
+            position = [row['Posición X'], row['Posición Y']]
 
             print(f"Potencia: {potencia} kW, Posición: {position}")
             potencias.append(float(potencia.replace(",", ".")))  # Convertimos a float y reemplazamos coma por punto si es necesario
@@ -50,12 +50,6 @@ def get_parcelas(pandas_df):
                 line = LineString(zip(x_coords, y_coords))
                 parcelas.append(line)
     return parcelas
-
-
-
-import numpy as np
-
-import numpy as np
 
 def place_CTs(potencias, positions):
     potencias = np.array(potencias)
@@ -168,7 +162,7 @@ def place_CTs(potencias, positions):
               f"Carga simultánea: {pot_simultanea:.2f} kVA (Máx 800) | "
               f"Momento del cableado: {coste_cluster:.2f} kW·m")
 
-    print(f"\n⚡ Sumatoria total del momento de carga (Mínimo global alcanzado): {sumatoria_coste_total:.2f} kW·m")
+    print(f"\n⚡ Sumatorio total del momento de carga (Mínimo global alcanzado): {sumatoria_coste_total:.2f} kW·m")
 
     return centros_de_masas_reales, labels, potencia_total_grupo
 
