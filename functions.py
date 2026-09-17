@@ -1,11 +1,10 @@
 import matplotlib.pyplot as plt 
 import pandas as pd
 import numpy as np
-from shapely.geometry import LineString
-from shapely.ops import polygonize
+import networkx as nx
+from shapely.geometry import LineString, Point
+from shapely.ops import polygonize, nearest_points
 from sklearn.cluster import KMeans
-
-import pulp
 
 def get_power(pandas_df):
     potencias = []
@@ -51,51 +50,197 @@ def get_parcelas(pandas_df):
                 parcelas.append(line)
     return parcelas
 
-def place_CTs(potencias, positions):
-    potencias = np.array(potencias)
-    positions = np.array(positions)
+def get_calles(pandas_df):
+    calles = []
+    for index, row in pandas_df.iterrows():
+        if not pd.isna(row['Inicial X']):
+            # Forzamos float nativo de Python para que Shapely y NetworkX no hereden objetos NumPy
+            x_coords = [float(row['Inicial X']), float(row['Fin X'])]
+            y_coords = [float(row['Inicial Y']), float(row['Fin Y'])]
+            line = LineString(zip(x_coords, y_coords))
+            calles.append(line)
+    return calles
+
+def generar_grafo_red(calles, posiciones_puntos, potencias_o_ceros, tolerancia=1.5, grafo_inicial=None):
+    """
+    Usa tu algoritmo original exacto para proyectar puntos (casas o CTs) 
+    sobre las calles, segmentar los tramos y devolver el grafo conectado.
+    Si se le pasa 'grafo_inicial', clona ese grafo y añade los puntos sobre él.
+    """
+    # Si no nos dan un grafo base, empezamos con uno vacío (caso del PASO 1)
+    if grafo_inicial is None:
+        G = nx.Graph()
+    else:
+        # Clonamos el grafo de forma instantánea (caso del PASO 2)
+        G = grafo_inicial.copy()
+
+    proyecciones_por_calle = {idx: [] for idx in range(len(calles))}
+    
+    # Proyección ortogonal exacta (Tu lógica original)
+    for pos, pot in zip(posiciones_puntos, potencias_o_ceros):
+        pos_limpia = tuple(map(float, pos))
+        geom_punto = Point(pos_limpia)
+        
+        min_dist = float('inf')
+        idx_calle_optima = None
+        punto_impacto = None
+        
+        for idx, calle in enumerate(calles):
+            d = geom_punto.distance(calle)
+            if d < min_dist:
+                min_dist = d
+                idx_calle_optima = idx
+                # Tu sintaxis original exacta para extraer la coordenada (X, Y)
+                punto_impacto = tuple(map(float, nearest_points(calle, geom_punto)[0].coords[0]))
+        
+        proyecciones_por_calle[idx_calle_optima].append((punto_impacto, pos_limpia, float(min_dist), float(pot)))
+
+    # Mecanismo Snapping original para soldar esquinas por proximidad
+    nodos_soldados = {}
+    # Si ya hay nodos en el grafo inicial, los registramos para no duplicar esquinas
+    if grafo_inicial is not None:
+        for n in grafo_inicial.nodes:
+            nodos_soldados[n] = n
+
+    def obtener_nodo_limpio(p, tol=tolerancia):
+        for n_existente in nodos_soldados:
+            if np.linalg.norm(np.array(n_existente) - np.array(p)) <= tol:
+                return n_existente
+        nodos_soldados[p] = p
+        return p
+
+    # Construcción y segmentación original de los tramos
+    for idx, calle in enumerate(calles):
+        coords_originales = [tuple(map(float, c)) for c in calle.coords]
+        proyecciones = proyecciones_por_calle[idx]
+        
+        for i in range(len(coords_originales) - 1):
+            u = obtener_nodo_limpio(coords_originales[i])
+            v = obtener_nodo_limpio(coords_originales[i+1])
+            
+            linea_tramo = LineString([u, v])
+            puntos_en_tramo = []
+            
+            for proj, casa_o_ct, d_acometida, pot in proyecciones:
+                if linea_tramo.distance(Point(proj)) < 1e-4:
+                    proj_limpio = obtener_nodo_limpio(proj)
+                    dist_desde_u = float(np.linalg.norm(np.array(u) - np.array(proj_limpio)))
+                    puntos_en_tramo.append((dist_desde_u, proj_limpio, casa_o_ct, d_acometida))
+            
+            puntos_en_tramo.sort(key=lambda x: x[0])
+            
+            nodo_actual = u
+            for dist_u, proj, casa_o_ct, d_acometida in puntos_en_tramo:
+                if nodo_actual != proj:
+                    G.add_edge(nodo_actual, proj, weight=float(np.linalg.norm(np.array(nodo_actual) - np.array(proj))))
+                
+                # Enganche físico de la acometida en el grafo
+                G.add_edge(proj, casa_o_ct, weight=d_acometida)
+                nodo_actual = proj
+                
+            if nodo_actual != v:
+                G.add_edge(nodo_actual, v, weight=float(np.linalg.norm(np.array(nodo_actual) - np.array(v))))
+
+    # Solo ejecutamos la sanación al crear el grafo base por primera vez (Paso 1)
+    # para no penalizar el rendimiento del clon de la iteración.
+    if grafo_inicial is None:
+        while not nx.is_connected(G):
+            # Extraemos todas las islas de calles desconectadas y las ordenamos por tamaño
+            componentes = sorted(list(nx.connected_components(G)), key=len, reverse=True)
+            isla_principal = componentes[0]
+            isla_huerfana = componentes[1] # La primera isla que está aislada
+            
+            min_dist_puente = float('inf')
+            mejor_nodo_principal = None
+            mejor_nodo_huerfano = None
+            
+            # Buscamos los dos puntos más cercanos entre ambas islas para crear una canalización de enlace
+            for np_nodo in isla_principal:
+                # Evitamos calcular sobre nodos-casa (que no son esquinas viales)
+                # Las casas se enviaron como tuplas, pero puedes discriminar si es necesario.
+                # Una aproximación segura es calcular la distancia euclidiana entre coordenadas
+                np_array_p = np.array(np_nodo)
+                
+                for nh_nodo in isla_huerfana:
+                    dist_puente = np.linalg.norm(np_array_p - np.array(nh_nodo))
+                    if dist_puente < min_dist_puente:
+                        min_dist_puente = dist_puente
+                        mejor_nodo_principal = np_nodo
+                        mejor_nodo_huerfano = nh_nodo
+            
+            # Creamos el puente físico (zanja de cruce) entre las dos zonas urbanas desconectadas
+            if mejor_nodo_principal and mejor_nodo_huerfano:
+                G.add_edge(mejor_nodo_principal, mejor_nodo_huerfano, weight=float(min_dist_puente))
+                print(f"🔗 Reparada isla urbana: Creado puente eléctrico de {min_dist_puente:.2f} metros.")
+
+    return G
+
+
+def place_CTs(potencias, positions, parcelas, calles):
+    potencias = np.array(potencias, dtype=float)
+    positions = np.array(positions, dtype=float)
     n_casas = len(positions)
     
     # 1. CÁLCULO DINÁMICO DE CLUSTERS
-    pot_CTs = [250, 400, 630, 800]  # Potencias de los CTs en kW
-    max_cap_ct = pot_CTs[-1]        # Límite estricto de 800 kW
-    
+    pot_CTs = [250, 400, 630, 800]
+    max_cap_ct = pot_CTs[-1]
     potencia_total_necesaria = sum(potencias) * 0.4 / 0.9
     n_clusters = int(np.ceil(potencia_total_necesaria / max_cap_ct))
     print(f"Número de clusters a generar: {n_clusters}")
 
+    # =========================================================================
+    # PASO 1: Ejecutar una vez el algoritmo para fijar las casas en las calles
+    # =========================================================================
+    grafo_base_casas = generar_grafo_red(calles, positions, potencias, tolerancia=1.5)
+
     # 2. INICIALIZACIÓN
     np.random.seed(42)
-    # Inicialización inteligente: elegimos las casas con más potencia como semillas iniciales
     indices_iniciales = np.argsort(-potencias)[:n_clusters]
     centros = positions[indices_iniciales].copy()
-    
-    # Ordenamos las casas de mayor a menor potencia para garantizar que las cargas
-    # más críticas (que penalizan más el coste del cable) elijan primero su centro óptimo
     orden_casas = np.argsort(-potencias)
     
     max_iter = 50
     labels = np.zeros(n_casas, dtype=int)
     
-    # 3. BUCLE ITERATIVO (Minimizando Sumatoria de Distancia * Potencia)
+    # 3. BUCLE ITERATIVO
     for iteracion in range(max_iter):
         labels_antiguos = labels.copy()
-        
         cargas_simultaneas_cts = np.zeros(n_clusters)
         cargas_nominales_cts = np.zeros(n_clusters)
         
+        # =========================================================================
+        # PASO 2: Clonar el grafo e inyectar dinámicamente los CTs usando la misma lógica
+        # =========================================================================
+        # Creamos un vector de ceros para los CTs ya que no aportan potencia al grafo, solo se conectan
+        ceros_ct = np.zeros(n_clusters)
+        grafo_iteracion = generar_grafo_red(calles, centros, ceros_ct, tolerancia=1.5, grafo_inicial=grafo_base_casas)
+
+        # =========================================================================
+        # PASO 3: Calcular las distancias mínimas en la red vial resultante
+        # =========================================================================
         for i in orden_casas:
             casa_coord = positions[i]
             casa_pot = potencias[i]
             casa_pot_simultanea = casa_pot * 0.4 / 0.9
             
-            # --- AQUÍ ESTÁ EL CAMBIO CLAVE ---
-            # Calculamos la distancia geométrica a cada centro
-            distancias = np.linalg.norm(centros - casa_coord, axis=1)
+            tupla_casa = tuple(map(float, casa_coord.tolist()))
+            
+            distancias_viales = np.zeros(n_clusters)
+            for c in range(n_clusters):
+                tupla_ct = tuple(map(float, centros[c].tolist()))
+                
+                try:
+                    # Al estar ambos perfectamente inyectados como nodos, vamos directo de punto a punto
+                    distancias_viales[c] = nx.shortest_path_length(
+                        grafo_iteracion, source=tupla_casa, target=tupla_ct, weight='weight'
+                    )
+                except (nx.NetworkXNoPath, KeyError):
+                    print("Fallo")
+
             
             # El coste real de conectar esta casa a cada centro es Distancia * Potencia
             # Al minimizar este coste, el algoritmo prioriza asignar casas grandes a centros muy cercanos
-            costes_linea = distancias * casa_pot
+            costes_linea = distancias_viales * casa_pot
             
             # Ordenamos los centros de menor a mayor coste de cable ponderado
             centros_ordenados_por_coste = np.argsort(costes_linea)
@@ -164,30 +309,62 @@ def place_CTs(potencias, positions):
 
     print(f"\n⚡ Sumatorio total del momento de carga (Mínimo global alcanzado): {sumatoria_coste_total:.2f} kW·m")
 
-    return centros_de_masas_reales, labels, potencia_total_grupo
+    return centros_de_masas_reales, labels, potencia_total_grupo, grafo_iteracion  # Devolvemos también el grafo final para la visualización
 
-
-def plot_graph(potencias, positions, parcelas, centros_transformacion_ideales, labels):
-    fig, ax = plt.subplots(figsize=(10, 10))
-
+def plot_graph(potencias, positions, parcelas, centros_transformacion_ideales, labels, calles, grafo_final):
+    fig, ax = plt.subplots(figsize=(12, 12))
     cmap = plt.get_cmap('tab10')
 
-    for position, potencia, label in zip(positions, potencias, labels):
-        ax.annotate(f"{potencia} kW", (position[0], position[1]), textcoords="offset points", xytext=(0,10), ha='center', fontsize=8, color=cmap(label))
-        ax.scatter(position[0], position[1], marker='x', color=cmap(label))
+    # 1. DIBUJAR LAS PARCELAS / CALLES BASE (Una sola vez fuera de los bucles)
+    for calle in calles:
+        x_coords, y_coords = calle.xy
+        ax.plot(x_coords, y_coords, color="gray", linewidth=1.5, alpha=0.4, zorder=1)
 
-    # Dibujamos las líneas una a una de forma independiente en color rojo
+    # Dibujamos las líneas de las parcelas en color rojo (Una sola vez)
     for parcela in parcelas:
         x_coords, y_coords = parcela.xy
-        ax.plot(x_coords, y_coords, color="red", linewidth=1.5)
+        ax.plot(x_coords, y_coords, color="red", linewidth=1.2, alpha=0.5, zorder=1)
 
-    # Dibujamos los centros de masa de potencia
-    for idx,centro in enumerate(centros_transformacion_ideales):
-       potencia_total = sum([potencias[i] for i in range(len(potencias)) if labels[i] == idx])
-       ax.scatter(centro[0], centro[1], marker='o', color=cmap(idx))
-       ax.annotate(f"{potencia_total*0.4/0.9} kW", (centro[0], centro[1]), textcoords="offset points", xytext=(0,10), ha='center', fontsize=8, color=cmap(idx))
+    # 2. CALCULAR Y DIBUJAR LOS CAMINOS ELÉCTRICOS DE CADA CASA A SU CT
+    for position, potencia, label in zip(positions, potencias, labels):
+        ct_asignado = centros_transformacion_ideales[label]
+        color_cluster = cmap(label)
+        
+        # Convertimos a tuplas puras para buscar en el grafo estructurado
+        tupla_casa = tuple(map(float, position.tolist())) if hasattr(position, "tolist") else tuple(map(float, position))
+        tupla_ct = tuple(map(float, ct_asignado.tolist())) if hasattr(ct_asignado, "tolist") else tuple(map(float, ct_asignado))
+        
+        # Recuperamos la ruta exacta nodo a nodo (incluye acometidas e infraestructura vial)
+        try:
+            camino_nodos = nx.shortest_path(grafo_final, source=tupla_casa, target=tupla_ct, weight='weight')
+            camino_coords = np.array(camino_nodos)
+            
+            # Dibujar la línea de cable continua sobre la calle
+            ax.plot(camino_coords[:, 0], camino_coords[:, 1], color=color_cluster, linewidth=2, alpha=0.8, zorder=3)
+        except (nx.NetworkXNoPath, KeyError):
+            # Línea de respaldo discontinua si hay alguna zona aislada topológicamente
+            ax.plot([position[0], ct_asignado[0]], [position[1], ct_asignado[1]], 
+                    color=color_cluster, linestyle="--", linewidth=1.2, alpha=0.4, zorder=2)
+
+        # Dibujar los puntos de las casas
+        ax.scatter(position[0], position[1], marker='x', color=color_cluster, s=45, zorder=4)
+        ax.annotate(f"{potencia} kW", (position[0], position[1]), textcoords="offset points", 
+                    xytext=(0,10), ha='center', fontsize=8, color=color_cluster, weight='bold')
+
+    # 3. DIBUJAR LOS CENTROS DE TRANSFORMACIÓN REALES (CTs)
+    for idx, centro in enumerate(centros_transformacion_ideales):
+        color_ct = cmap(idx)
+        potencia_total = sum([potencias[i] for i in range(len(potencias)) if labels[i] == idx])
+        pot_simultanea = potencia_total * 0.4 / 0.9
+        
+        # Dibujamos el CT con un marcador cuadrado destacado con borde negro
+        ax.scatter(centro[0], centro[1], marker='s', color=color_ct, s=140, edgecolor='black', linewidth=1.5, zorder=5)
+        ax.annotate(f"⚡ CT {idx+1}\n{pot_simultanea:.1f} kVA", (centro[0], centro[1]), textcoords="offset points", 
+                    xytext=(0,12), ha='center', fontsize=9, color='black', weight='bold',
+                    bbox=dict(boxstyle="round,pad=0.3", fc="white", ec=color_ct, alpha=0.9))
 
     ax.set_aspect('equal')
-    plt.title("Líneas en bruto desde el Excel (Sin agrupar)")
+    plt.title("Trazado Eléctrico Optimizado por Calles con Restricción de Capacidad", fontsize=12, weight='bold')
     plt.grid(True, linestyle='--', alpha=0.5)
+    plt.tight_layout()
     plt.show()
