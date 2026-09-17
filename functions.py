@@ -5,6 +5,8 @@ from shapely.geometry import LineString
 from shapely.ops import polygonize
 from sklearn.cluster import KMeans
 
+import pulp
+
 def get_power(pandas_df):
     potencias = []
     positions = []
@@ -49,19 +51,127 @@ def get_parcelas(pandas_df):
                 parcelas.append(line)
     return parcelas
 
+
+
+import numpy as np
+
+import numpy as np
+
 def place_CTs(potencias, positions):
-    # Implementamos K-Means clásico adaptado con pesos en la muestra
-    # n_clusters será el número de CTs que quieres colocar
-    pot_CTs = [250, 400, 630, 800]  # Potencias de los CTs en kW
-    n_clusters = int(np.ceil((sum(potencias)*0.4/0.9)/pot_CTs[-1]))  # Ajusta este cálculo según tus necesidades
-    print(n_clusters)
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    labels = kmeans.fit_predict(positions, sample_weight=potencias)
+    potencias = np.array(potencias)
+    positions = np.array(positions)
+    n_casas = len(positions)
     
-    # Estos son los puntos óptimos teóricos (los centros de masa de potencia)
-    centros_transformacion_ideales = kmeans.cluster_centers_
+    # 1. CÁLCULO DINÁMICO DE CLUSTERS
+    pot_CTs = [250, 400, 630, 800]  # Potencias de los CTs en kW
+    max_cap_ct = pot_CTs[-1]        # Límite estricto de 800 kW
+    
+    potencia_total_necesaria = sum(potencias) * 0.4 / 0.9
+    n_clusters = int(np.ceil(potencia_total_necesaria / max_cap_ct))
+    print(f"Número de clusters a generar: {n_clusters}")
+
+    # 2. INICIALIZACIÓN
+    np.random.seed(42)
+    # Inicialización inteligente: elegimos las casas con más potencia como semillas iniciales
+    indices_iniciales = np.argsort(-potencias)[:n_clusters]
+    centros = positions[indices_iniciales].copy()
+    
+    # Ordenamos las casas de mayor a menor potencia para garantizar que las cargas
+    # más críticas (que penalizan más el coste del cable) elijan primero su centro óptimo
+    orden_casas = np.argsort(-potencias)
+    
+    max_iter = 50
+    labels = np.zeros(n_casas, dtype=int)
+    
+    # 3. BUCLE ITERATIVO (Minimizando Sumatoria de Distancia * Potencia)
+    for iteracion in range(max_iter):
+        labels_antiguos = labels.copy()
         
-    return centros_transformacion_ideales, labels
+        cargas_simultaneas_cts = np.zeros(n_clusters)
+        cargas_nominales_cts = np.zeros(n_clusters)
+        
+        for i in orden_casas:
+            casa_coord = positions[i]
+            casa_pot = potencias[i]
+            casa_pot_simultanea = casa_pot * 0.4 / 0.9
+            
+            # --- AQUÍ ESTÁ EL CAMBIO CLAVE ---
+            # Calculamos la distancia geométrica a cada centro
+            distancias = np.linalg.norm(centros - casa_coord, axis=1)
+            
+            # El coste real de conectar esta casa a cada centro es Distancia * Potencia
+            # Al minimizar este coste, el algoritmo prioriza asignar casas grandes a centros muy cercanos
+            costes_linea = distancias * casa_pot
+            
+            # Ordenamos los centros de menor a mayor coste de cable ponderado
+            centros_ordenados_por_coste = np.argsort(costes_linea)
+            
+            asignado = False
+            for c in centros_ordenados_por_coste:
+                # Comprobamos la restricción de los 800 kW simultáneos
+                if cargas_simultaneas_cts[c] + casa_pot_simultanea <= max_cap_ct:
+                    labels[i] = c
+                    cargas_simultaneas_cts[c] += casa_pot_simultanea
+                    cargas_nominales_cts[c] += casa_pot
+                    asignado = True
+                    break
+            
+            # Caso de emergencia por si se llenan todos los centros óptimos
+            if not asignado:
+                c_con_espacio = np.argmin(cargas_simultaneas_cts)
+                labels[i] = c_con_espacio
+                cargas_simultaneas_cts[c_con_espacio] += casa_pot_simultanea
+                cargas_nominales_cts[c_con_espacio] += casa_pot
+
+        # 4. RECALCULAR CENTROS DE MASAS REALES (Tu fórmula exacta)
+        nuevos_centros = np.zeros_like(centros)
+        for j in range(n_clusters):
+            mascara_grupo = np.where(labels == j)[0]
+            potencias_grupo = potencias[mascara_grupo]
+            posiciones_grupo = positions[mascara_grupo]
+            potencia_total_grupo = sum(potencias_grupo)
+            
+            if potencia_total_grupo > 0:
+                x_ponderada = posiciones_grupo[:, 0] * potencias_grupo
+                y_ponderada = posiciones_grupo[:, 1] * potencias_grupo
+                
+                centro_x_real = sum(x_ponderada) / potencia_total_grupo
+                centro_y_real = sum(y_ponderada) / potencia_total_grupo
+                nuevos_centros[j] = [centro_x_real, centro_y_real]
+            else:
+                nuevos_centros[j] = positions[np.random.choice(n_casas)]
+                
+        if np.array_equal(labels, labels_antiguos):
+            break
+            
+        centros = nuevos_centros
+
+    # 5. IMPRESIÓN DE RESULTADOS Y CÁLCULO DEL COSTE TOTAL DEL CABLEADO
+    centros_de_masas_reales = centros
+    sumatoria_coste_total = 0
+    
+    print("\n--- RESULTADOS DE LA OPTIMIZACIÓN (MINIMIZANDO DISTANCIA * POTENCIA) ---")
+    for j in range(n_clusters):
+        mascara_grupo = np.where(labels == j)[0]
+        potencias_grupo = potencias[mascara_grupo]
+        posiciones_grupo = positions[mascara_grupo]
+        potencia_total_grupo = sum(potencias_grupo)
+        pot_simultanea = potencia_total_grupo * 0.4 / 0.9
+        
+        # Calcular el coste de cable ponderado de este cluster específico
+        distancias_grupo = np.linalg.norm(posiciones_grupo - centros_de_masas_reales[j], axis=1)
+        coste_cluster = sum(distancias_grupo * potencias_grupo)
+        sumatoria_coste_total += coste_cluster
+        
+        print(f"📊 Grupo {j+1}: {len(potencias_grupo)} parcelas | "
+              f"Centro real: X={centros_de_masas_reales[j,0]:.2f}, Y={centros_de_masas_reales[j,1]:.2f} | "
+              f"Carga simultánea: {pot_simultanea:.2f} kVA (Máx 800) | "
+              f"Momento del cableado: {coste_cluster:.2f} kW·m")
+
+    print(f"\n⚡ Sumatoria total del momento de carga (Mínimo global alcanzado): {sumatoria_coste_total:.2f} kW·m")
+
+    return centros_de_masas_reales, labels, potencia_total_grupo
+
 
 def plot_graph(potencias, positions, parcelas, centros_transformacion_ideales, labels):
     fig, ax = plt.subplots(figsize=(10, 10))

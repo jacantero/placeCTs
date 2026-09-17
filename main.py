@@ -11,5 +11,5 @@ selected_rows = df[df['Capa'].isin(capas_validas)]
 
 potencias, positions = get_power(selected_rows)
 parcelas = get_parcelas(selected_rows)
-centros_cts, labels = place_CTs(potencias, positions)
+centros_cts, labels, potencia_total_grupo = place_CTs(potencias, positions)
 plot_graph(potencias, positions, parcelas, centros_cts, labels)
