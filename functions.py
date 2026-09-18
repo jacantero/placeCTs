@@ -426,6 +426,8 @@ def plot_graph(potencias, positions, parcelas, centros, labels, calles, G,
             ax.plot([pos[0], centros[int(lab)][0]], [pos[1], centros[int(lab)][1]],
                     color=color, linestyle="--", linewidth=1.2, alpha=0.4, zorder=2)
         ax.scatter(pos[0], pos[1], marker="x", color=color, s=40, zorder=4)
+        ax.annotate(f"{pot} kW", (pos[0], pos[1]), textcoords="offset points", 
+                    xytext=(0,10), ha='center', fontsize=8, color=color, weight='bold')
  
     for j, centro in enumerate(centros):
         color = cmap(j % 10)
