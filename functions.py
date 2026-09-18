@@ -682,3 +682,60 @@ def plot_graph(potencias, positions, parcelas, centros, labels, calles, G,
     else:
         plt.show()
     return ruta
+
+from pyautocad import Autocad, APoint
+
+import math
+from shapely.geometry import Point
+from shapely.ops import nearest_points
+
+def insertar_en_autocad_directo(centros, parcelas):
+    # Conecta con la instancia activa de AutoCAD
+    acad = Autocad(create_if_not_exists=True)
+    print(f"Conectado a: {acad.doc.Name}")
+    
+    # Nombre del bloque preexistente
+    nombre_bloque = "CT_python"
+    
+    for centro in centros:
+        # 1. Crear punto de Shapely para cálculos geométricos
+        p_centro = Point(centro[0], centro[1])
+        
+        # 2. Encontrar la parcela (LineString) más cercana
+        parcela_cercana = min(parcelas, key=lambda p: p_centro.distance(p))
+        
+        # 3. Encontrar el punto exacto de la parcela más cercano al centro
+        # nearest_points devuelve (punto_en_p_centro, punto_en_parcela_cercana)
+        _, p_linea_cercano = nearest_points(p_centro, parcela_cercana)
+        
+        # 4. Encontrar el segmento de la LineString donde cae ese punto cercano
+        coords = list(parcela_cercana.coords)
+        angulo_rotacion = 0.0
+        dist_minima = float('inf')
+        
+        # Recorremos los segmentos de la parcela para ver cuál contiene/está más cerca del punto proyectado
+        for i in range(len(coords) - 1):
+            p1 = coords[i]
+            p2 = coords[i+1]
+            
+            # Creamos un mini-segmento temporal
+            from shapely.geometry import LineString
+            segmento = LineString([p1, p2])
+            
+            dist = p_linea_cercano.distance(segmento)
+            # Tolerancia casi cero para saber que el punto proyectado cae en este segmento
+            if dist < dist_minima and dist < 1e-5: 
+                dist_minima = dist
+                # Calcular el ángulo del segmento (Delta Y / Delta X)
+                dx = p2[0] - p1[0]
+                dy = p2[1] - p1[1]
+                angulo_rotacion = math.atan2(dy, dx)
+                break # Encontrado
+        
+        # 5. Insertar en AutoCAD con la rotación calculada (en radianes)
+        punto = APoint(centro[0], centro[1])
+        # Inserción: Punto, Nombre, EscalaX, EscalaY, EscalaZ, Rotación
+        acad.model.InsertBlock(punto, nombre_bloque, 1.0, 1.0, 1.0, angulo_rotacion)
+        
+    print(f"Se han insertado {len(centros)} centros de transformación orientados.")
+
