@@ -3,26 +3,34 @@ Ubicacion de centros de transformacion (CT) y trazado de acometidas sobre red vi
  
 Objetivo optimizado de forma explicita y coherente en todo el codigo:
  
-    minimizar  SUM_i  P_i * d_red(casa_i, CT(casa_i))          [kW*m]
+    minimizar  SUM_i  P_i * c_red(casa_i, CT(casa_i))          [kW*m equivalentes]
     sujeto a   SUM_{i en CT_j} P_i * ks / cos_phi  <=  cap_max  para todo j
  
-donde d_red es la distancia recorrida por las calles (no la euclidea) y los CT
-solo pueden ubicarse sobre la red vial.
+donde c_red es la longitud recorrida por las calles afectada por el factor de
+penalizacion de cada calle (1.0 en calle principal, `penalizacion` en
+secundaria). La longitud REAL de cada linea se sigue calculando y reportando
+aparte (es la que importa para caida de tension y para el presupuesto).
  
-Diferencias de fondo frente a la version basada en k-means ponderado:
+Restricciones de implantacion:
  
-  * La actualizacion de la ubicacion del CT es la 1-mediana discreta sobre el
-    grafo (argmin sobre nodos de calle de SUM P_i*d_red). El centro de masas
-    ponderado minimiza SUM P_i*d^2 euclidea, que es otro problema y sesga el CT
-    hacia la nube de casas en vez de hacia el optimo de momento electrico.
-  * El grafo se construye UNA sola vez y las distancias casa->nodo se
-    precalculan con un Dijkstra por punto de acometida, por lo que iterar es
-    aritmetica vectorizada y no miles de shortest_path.
-  * La asignacion respeta capacidad con un greedy por arrepentimiento
-    (regret) seguido de busqueda local (reubicacion + intercambio), en vez de
-    un greedy de una pasada por potencia descendente.
-  * Nunca se asigna coste 0 a un CT inalcanzable (era el fallo que provocaba
-    los cableados absurdos): la distancia es inf y el CT queda descartado.
+  * Los CT se ubican DENTRO de una parcela, retranqueados `retranqueo` metros
+    de un lindero que da a calle (nunca sobre la calzada ni en el centro de la
+    manzana).
+  * Una calle es PRINCIPAL si la separacion entre su eje y las parcelas
+    colindantes es >= `umbral_principal` (20 m por defecto); en caso contrario
+    es secundaria y sus tramos se penalizan, de modo que el trazado y los CT
+    se apoyan en viario principal salvo que el rodeo salga caro.
+ 
+Frente a la version basada en k-means ponderado:
+ 
+  * La recolocacion del CT es la 1-mediana discreta sobre el grafo (argmin de
+    SUM P_i*c_red sobre los candidatos), no el baricentro ponderado (que
+    minimiza SUM P*d^2 euclidea, otro problema distinto).
+  * El grafo se construye UNA sola vez y las distancias casa->candidato se
+    precalculan con un Dijkstra por punto de acometida.
+  * La asignacion respeta capacidad con greedy por arrepentimiento + busqueda
+    local (reubicacion e intercambio).
+  * Un CT inalcanzable tiene coste inf, nunca 0.
 """
  
 from __future__ import annotations
@@ -32,12 +40,16 @@ from collections import defaultdict
  
 import numpy as np
 import networkx as nx
-from shapely.geometry import Point, LineString
-from shapely.ops import nearest_points
+from shapely.geometry import Point, LineString, LinearRing, Polygon
+from shapely.ops import nearest_points, unary_union
  
 POT_CTS = (250.0, 400.0, 630.0, 800.0)
 KS = 0.4          # coeficiente de simultaneidad
 COS_PHI = 0.9     # factor de potencia
+ 
+ 
+# ---------------------------------------------------------------------------
+# Utilidades geometricas
 
 import matplotlib
 import matplotlib.pyplot as plt 
@@ -97,9 +109,8 @@ def get_calles(pandas_df):
             line = LineString(zip(x_coords, y_coords))
             calles.append(line)
     return calles
-
 # ---------------------------------------------------------------------------
-# Construccion de la red vial
+# Utilidades geometricas
 # ---------------------------------------------------------------------------
  
 def _snapper(tol):
@@ -119,28 +130,129 @@ def _snapper(tol):
     return snap
  
  
-def construir_red(calles, positions, paso_candidatos=10.0, tolerancia=1.5):
-    """Devuelve (G, nodos_casa, nodos_calle).
+def _poligono(parcela):
+    """Devuelve el Polygon de una parcela dada como ring/linea cerrada, o None."""
+    if isinstance(parcela, Polygon):
+        return parcela
+    coords = list(parcela.coords)
+    if len(coords) >= 4 and math.dist(coords[0], coords[-1]) < 1e-6:
+        try:
+            p = Polygon(LinearRing(coords))
+            return p if p.is_valid and p.area > 0 else None
+        except Exception:
+            return None
+    return None
  
-    - Cada calle se trocea en sus vertices, en las proyecciones de las casas y
-      en puntos equiespaciados cada `paso_candidatos` metros (ubicaciones
-      candidatas para los CT).
-    - El peso de cada tramo es la longitud REAL recorrida sobre la polilinea.
-    - Cada casa cuelga de su proyeccion con el peso de su acometida.
+ 
+def clasificar_calles(calles, parcelas, umbral_principal=20.0, paso_muestreo=5.0):
+    """True = calle principal.
+ 
+    Criterio del proyecto: la calle es principal cuando la separacion entre el
+    eje y las parcelas colindantes es de al menos `umbral_principal` metros.
+    Se usa la MEDIANA de la separacion muestreada a lo largo de la calle, para
+    que un encuentro puntual con una esquina no degrade la clasificacion.
     """
+    if not parcelas:
+        return [True] * len(calles)
+    union = unary_union([p.boundary if isinstance(p, Polygon) else p for p in parcelas])
+    principales = []
+    for calle in calles:
+        L = calle.length
+        n = max(2, int(L // paso_muestreo) + 1)
+        seps = [union.distance(calle.interpolate(k * L / (n - 1))) for k in range(n)]
+        principales.append(float(np.median(seps)) >= umbral_principal)
+    return principales
+ 
+ 
+def candidatos_en_parcelas(parcelas, calles, retranqueo=3.0, paso=10.0,
+                           dist_max_calle=40.0):
+    """Puntos candidatos para CT: dentro de la parcela, pegados a un lindero
+    que da a calle.
+ 
+    Para cada lindero se muestrea cada `paso` metros y el punto se desplaza
+    `retranqueo` metros hacia el interior de la parcela (si la parcela no es un
+    poligono cerrado, hacia el lado opuesto a la calle). Se descartan los
+    linderos que no dan a calle (> `dist_max_calle`).
+ 
+    Devuelve tuplas (x, y, j) donde `j` es la calle a la que da frente ese
+    lindero: es la que decide si el CT queda a pie de calle principal.
+    """
+    red = unary_union(calles)
+    candidatos = []
+    for parcela in parcelas:
+        poly = _poligono(parcela)
+        borde = parcela.exterior if isinstance(parcela, Polygon) else parcela
+        L = borde.length
+        if L <= 0:
+            continue
+        n = max(1, int(L // paso))
+        for k in range(n):
+            s = (k + 0.5) * L / n
+            p = borde.interpolate(s)
+            d_calle = red.distance(p)
+            if d_calle > dist_max_calle:
+                continue
+            j_frente = min(range(len(calles)), key=lambda q: p.distance(calles[q]))
+            # normal al lindero en ese punto
+            eps = min(1.0, L / 100.0)
+            a = borde.interpolate(max(0.0, s - eps))
+            b = borde.interpolate(min(L, s + eps))
+            tx, ty = b.x - a.x, b.y - a.y
+            norm = math.hypot(tx, ty)
+            if norm < 1e-9:
+                continue
+            nx_, ny_ = -ty / norm, tx / norm
+            c1 = Point(p.x + nx_ * retranqueo, p.y + ny_ * retranqueo)
+            c2 = Point(p.x - nx_ * retranqueo, p.y - ny_ * retranqueo)
+            if poly is not None:
+                dentro = [c for c in (c1, c2) if poly.contains(c)]
+                if not dentro:
+                    continue
+                c = dentro[0]
+            else:
+                # sin poligono: el interior es el lado contrario a la calle
+                c = c1 if red.distance(c1) > red.distance(c2) else c2
+            candidatos.append((float(c.x), float(c.y), j_frente))
+    return candidatos
+ 
+ 
+# ---------------------------------------------------------------------------
+# Construccion de la red
+# ---------------------------------------------------------------------------
+ 
+def construir_red(calles, positions, parcelas=(), retranqueo=3.0,
+                  paso_candidatos=10.0, tolerancia=1.5,
+                  umbral_principal=20.0, penalizacion=1.6,
+                  calles_principales=None, dist_max_calle=40.0):
+    """Grafo unico con casas, candidatos a CT y viario.
+ 
+    Cada arista lleva:
+      weight -> longitud real en metros
+      coste  -> longitud penalizada (metros * factor de la calle)
+    """
+    if calles_principales is None:
+        calles_principales = clasificar_calles(calles, list(parcelas), umbral_principal)
+    factor = [1.0 if pr else float(penalizacion) for pr in calles_principales]
+ 
+    puntos_ct = candidatos_en_parcelas(list(parcelas), calles, retranqueo,
+                                       paso_candidatos, dist_max_calle) if parcelas else []
+ 
     G = nx.Graph()
     snap = _snapper(tolerancia)
     cortes = defaultdict(set)
-    proy_casa = []
  
-    for pos in positions:
-        p = Point(float(pos[0]), float(pos[1]))
-        mejor = min(range(len(calles)), key=lambda k: p.distance(calles[k]))
-        calle = calles[mejor]
-        q = nearest_points(calle, p)[0]
-        s = float(calle.project(q))
-        cortes[mejor].add(s)
-        proy_casa.append((mejor, s, float(p.distance(calle))))
+    def proyectar(xy, j=None):
+        p = Point(float(xy[0]), float(xy[1]))
+        if j is None:
+            j = min(range(len(calles)), key=lambda k: p.distance(calles[k]))
+        q = nearest_points(calles[j], p)[0]
+        return j, float(calles[j].project(q)), float(p.distance(calles[j]))
+ 
+    proy_casa = [proyectar(pos) for pos in positions]
+    # el CT se engancha a SU calle de frente, no a la mas cercana en linea recta
+    proy_ct = [proyectar(c[:2], c[2]) for c in puntos_ct]
+    for j, s, _ in proy_casa + proy_ct:
+        cortes[j].add(s)
  
     for idx, calle in enumerate(calles):
         L = float(calle.length)
@@ -151,10 +263,9 @@ def construir_red(calles, positions, paso_candidatos=10.0, tolerancia=1.5):
             acc += math.dist(a, b)
             cortes[idx].add(min(acc, L))
         if paso_candidatos and paso_candidatos > 0:
-            n = int(L // paso_candidatos)
-            cortes[idx].update(k * paso_candidatos for k in range(1, n + 1))
+            cortes[idx].update(k * paso_candidatos for k in range(1, int(L // paso_candidatos) + 1))
  
-    nodo_de = {}          # (idx_calle, s) -> nodo
+    nodo_de = {}
     for idx, calle in enumerate(calles):
         ss = sorted(cortes[idx])
         nodos = []
@@ -166,34 +277,52 @@ def construir_red(calles, positions, paso_candidatos=10.0, tolerancia=1.5):
             nodo_de[(idx, s)] = n
             nodos.append(n)
         for (s0, n0), (s1, n1) in zip(zip(ss, nodos), zip(ss[1:], nodos[1:])):
-            if n0 != n1:
-                w = s1 - s0
-                if not G.has_edge(n0, n1) or G[n0][n1]["weight"] > w:
-                    G.add_edge(n0, n1, weight=w, tipo="calle")
+            if n0 == n1:
+                continue
+            w = s1 - s0
+            c = w * factor[idx]
+            if not G.has_edge(n0, n1) or G[n0][n1]["coste"] > c:
+                G.add_edge(n0, n1, weight=w, coste=c, tipo="calle",
+                           principal=calles_principales[idx])
  
-    _conectar_islas(G)
+    _conectar_islas(G, penalizacion)
  
     nodos_casa = []
     for i, (idx, s, d) in enumerate(proy_casa):
         nc = ("CASA", i)
         G.add_node(nc, pos=(float(positions[i][0]), float(positions[i][1])), tipo="casa")
-        G.add_edge(nc, nodo_de[(idx, s)], weight=d, tipo="acometida")
+        G.add_edge(nc, nodo_de[(idx, s)], weight=d, coste=d, tipo="acometida")
         nodos_casa.append(nc)
  
-    nodos_calle = [n for n, d in G.nodes(data=True) if d["tipo"] == "calle"]
-    return G, nodos_casa, nodos_calle
+    nodos_ct = []
+    vistos = set()
+    for i, (idx, s, d) in enumerate(proy_ct):
+        clave = nodo_de[(idx, s)], round(puntos_ct[i][0], 2), round(puntos_ct[i][1], 2)
+        if clave in vistos:
+            continue
+        vistos.add(clave)
+        nct = ("CT", i)
+        G.add_node(nct, pos=puntos_ct[i][:2], tipo="ct_cand",
+                   principal=calles_principales[idx], calle=idx)
+        # el enlace CT-calle atraviesa el retranqueo: se penaliza como la calle
+        G.add_edge(nct, nodo_de[(idx, s)], weight=d, coste=d * factor[idx], tipo="enlace_ct")
+        nodos_ct.append(nct)
+ 
+    return G, nodos_casa, nodos_ct, calles_principales
  
  
-def _conectar_islas(G):
-    """Une componentes desconectadas por el par de nodos de CALLE mas cercano."""
+def _conectar_islas(G, penalizacion):
+    """Une componentes por el par de nodos de CALLE mas cercano."""
     while not nx.is_connected(G):
         comps = sorted(nx.connected_components(G), key=len, reverse=True)
-        principal = np.array([n for n in comps[0] if G.nodes[n]["tipo"] == "calle"], dtype=float)
         ids_p = [n for n in comps[0] if G.nodes[n]["tipo"] == "calle"]
+        if not ids_p:
+            break
+        principal = np.array(ids_p, dtype=float)
         mejor = (float("inf"), None, None)
         for comp in comps[1:]:
             ids_h = [n for n in comp if G.nodes[n]["tipo"] == "calle"]
-            if not ids_h or len(principal) == 0:
+            if not ids_h:
                 continue
             H = np.array(ids_h, dtype=float)
             d = np.linalg.norm(principal[:, None, :] - H[None, :, :], axis=2)
@@ -202,22 +331,23 @@ def _conectar_islas(G):
                 mejor = (float(d[i, j]), ids_p[i], ids_h[j])
         if mejor[1] is None:
             break
-        G.add_edge(mejor[1], mejor[2], weight=mejor[0], tipo="enlace")
+        G.add_edge(mejor[1], mejor[2], weight=mejor[0],
+                   coste=mejor[0] * penalizacion, tipo="enlace")
  
  
 # ---------------------------------------------------------------------------
-# Matriz de distancias casa -> nodo de calle (una sola vez)
+# Matriz de distancias casa -> candidato (una sola vez)
 # ---------------------------------------------------------------------------
  
-def matriz_distancias(G, nodos_casa, nodos_calle):
-    idx_nodo = {n: k for k, n in enumerate(nodos_calle)}
-    D = np.full((len(nodos_casa), len(nodos_calle)), np.inf)
- 
+def matriz_distancias(G, nodos_casa, candidatos, peso="coste"):
+    idx_nodo = {n: k for k, n in enumerate(candidatos)}
+    D = np.full((len(nodos_casa), len(candidatos)), np.inf)
     cache = {}
     for i, nc in enumerate(nodos_casa):
-        (raiz, acom), = ((v, dd["weight"]) for v, dd in G[nc].items())
+        (raiz, dd), = ((v, data) for v, data in G[nc].items())
+        acom = dd[peso]
         if raiz not in cache:
-            cache[raiz] = nx.single_source_dijkstra_path_length(G, raiz, weight="weight")
+            cache[raiz] = nx.single_source_dijkstra_path_length(G, raiz, weight=peso)
         for n, d in cache[raiz].items():
             k = idx_nodo.get(n)
             if k is not None:
@@ -230,13 +360,13 @@ def matriz_distancias(G, nodos_casa, nodos_calle):
 # ---------------------------------------------------------------------------
  
 def _asignar(costes, carga_sim, cap):
-    """Greedy por arrepentimiento + busqueda local. costes[i, j] = P_i*d_ij."""
+    """Greedy por arrepentimiento + busqueda local. costes[i, j] = P_i*c_ij."""
     n, k = costes.shape
     labels = np.full(n, -1)
     usado = np.zeros(k)
- 
     orden_pref = np.argsort(costes, axis=1)
     pendientes = set(range(n))
+ 
     while pendientes:
         mejor_i, mejor_j, mejor_regret = None, None, -np.inf
         for i in pendientes:
@@ -246,11 +376,10 @@ def _asignar(costes, carga_sim, cap):
                 continue
             c1 = costes[i, factibles[0]]
             c2 = costes[i, factibles[1]] if len(factibles) > 1 else c1 * 2 + 1.0
-            regret = c2 - c1
-            if regret > mejor_regret:
-                mejor_i, mejor_j, mejor_regret = i, factibles[0], regret
+            if c2 - c1 > mejor_regret:
+                mejor_i, mejor_j, mejor_regret = i, factibles[0], c2 - c1
         if mejor_i is None:
-            return None, np.inf  # no cabe: hacen falta mas CT
+            return None, np.inf
         labels[mejor_i] = mejor_j
         usado[mejor_j] += carga_sim[mejor_i]
         pendientes.discard(mejor_i)
@@ -296,50 +425,120 @@ def _busqueda_local(costes, carga_sim, cap, labels, usado, max_pasadas=30):
 # Algoritmo principal
 # ---------------------------------------------------------------------------
  
-def place_CTs(potencias, positions, parcelas, calles, paso_candidatos=10.0,
-              tolerancia=1.5, utilizacion_max=1.0, max_iter=50, verbose=True):
+def place_CTs(potencias, positions, parcelas, calles, retranqueo=3.0,
+              paso_candidatos=10.0, tolerancia=1.5, umbral_principal=20.0,
+              penalizacion=1.6, calles_principales=None, utilizacion_max=1.0,
+              ct_solo_principal=True, radio_fallback_principal=150.0,
+              max_iter=50, verbose=True):
+    """`ct_solo_principal`: el CT se implanta en parcela con frente a calle
+    principal; solo cae a un frente secundario cuando ese grupo no tiene
+    ninguna parcela con frente principal a menos de `radio_fallback_principal`
+    metros de red (None = sin escapatoria, principal siempre).
+    """
     potencias = np.asarray(potencias, dtype=float)
     positions = np.asarray(positions, dtype=float)
-    n = len(positions)
- 
     carga_sim = potencias * KS / COS_PHI
     cap = POT_CTS[-1] * utilizacion_max
  
-    G, nodos_casa, nodos_calle = construir_red(calles, positions, paso_candidatos, tolerancia)
-    D = matriz_distancias(G, nodos_casa, nodos_calle)          # [n x m] metros
-    C = D * potencias[:, None]                                  # [n x m] kW*m
+    G, nodos_casa, cands, principales = construir_red(
+        calles, positions, parcelas, retranqueo, paso_candidatos, tolerancia,
+        umbral_principal, penalizacion, calles_principales)
+    if not cands:
+        raise ValueError("No hay candidatos de CT: revisa las parcelas o dist_max_calle")
+ 
+    pr_cand = np.array([bool(G.nodes[n].get("principal")) for n in cands])
+    if ct_solo_principal and not pr_cand.any():
+        ct_solo_principal = False
+        if verbose:
+            print("Aviso: ninguna parcela tiene frente a calle principal; "
+                  "se admiten frentes secundarios")
+    if verbose:
+        n_pr = sum(principales)
+        print(f"{len(cands)} ubicaciones candidatas en parcela "
+              f"({int(pr_cand.sum())} con frente principal) | "
+              f"{n_pr}/{len(calles)} calles principales (separacion >= {umbral_principal} m) | "
+              f"penalizacion secundaria x{penalizacion}")
+ 
+    D_real = matriz_distancias(G, nodos_casa, cands, peso="weight")
+    C_pen = matriz_distancias(G, nodos_casa, cands, peso="coste") * potencias[:, None]
+    permitidos = _permiso_principal(pr_cand, D_real, ct_solo_principal,
+                                    radio_fallback_principal)
  
     k = max(1, int(np.ceil(carga_sim.sum() / cap)))
     while True:
-        res = _resolver_k(D, C, carga_sim, cap, k, potencias, max_iter)
+        res = _resolver_k(C_pen, carga_sim, cap, k, potencias, max_iter, permitidos)
         if res is not None:
             break
         k += 1
         if verbose:
-            print(f"Capacidad insuficiente o geometria incompatible: probando con {k} CT")
+            print(f"Sin solucion factible con {k-1} CT: probando con {k}")
  
-    labels, idx_cts, coste = res
-    centros = np.array([nodos_calle[j] for j in idx_cts], dtype=float)
-    nodos_ct = [nodos_calle[j] for j in idx_cts]
+    labels, idx_cts, coste_pen = res
+    nodos_ct = [cands[j] for j in idx_cts]
+    centros = np.array([G.nodes[n]["pos"] for n in nodos_ct], dtype=float)
  
-    resumen = _informe(labels, potencias, carga_sim, D, idx_cts, coste, centros, verbose)
+    largos, pen_tramo = _longitudes_reales(G, nodos_casa, nodos_ct, labels)
+    resumen = _informe(labels, potencias, carga_sim, largos, pen_tramo, coste_pen,
+                       centros, nodos_ct, G, verbose)
     return centros, labels, resumen, G, nodos_casa, nodos_ct
  
  
-def _resolver_k(D, C, carga_sim, cap, k, potencias, max_iter):
-    """k-mediana capacitada sobre la red: init k-means++ ponderado + Lloyd discreto."""
+def _permiso_principal(pr_cand, D_real, ct_solo_principal, radio):
+    """Devuelve una funcion grupo -> candidatos admisibles para su CT.
+ 
+    Con `ct_solo_principal` solo se admiten parcelas con frente a calle
+    principal; se abre a frentes secundarios unicamente cuando el grupo no
+    tiene ninguna parcela con frente principal a menos de `radio` metros de
+    red (es decir, cuando la opcion de calle principal no existe).
+    """
+    idx_pr = np.flatnonzero(pr_cand)
+    todos = np.arange(len(pr_cand))
+    if not ct_solo_principal:
+        return lambda mask: todos
+    if radio is None:
+        return lambda mask: idx_pr
+ 
+    cerca = D_real[:, idx_pr] <= float(radio)      # casa x candidato principal
+ 
+    def permitidos(mask):
+        if not mask.any():
+            return idx_pr
+        alcanzables = idx_pr[cerca[mask].any(axis=0)]
+        return alcanzables if alcanzables.size else todos
+ 
+    return permitidos
+ 
+ 
+def _resolver_k(C, carga_sim, cap, k, potencias, max_iter, permitidos=None):
+    """k-mediana capacitada: init k-means++ ponderado + Lloyd discreto."""
     n, m = C.shape
     rng = np.random.default_rng(42)
-    nodo_de_casa = np.argmin(D, axis=1)          # nodo de acometida de cada casa
+    if permitidos is None:
+        todos = np.arange(m)
+        permitidos = lambda mask: todos
+    global_adm = permitidos(np.ones(n, dtype=bool))
  
-    centros = [int(np.argmin(np.where(np.isfinite(C), C, np.inf).sum(axis=0)))]
+    def _mejor(mask):
+        """1-mediana discreta del grupo entre sus candidatos admisibles."""
+        adm = permitidos(mask)
+        col = np.where(np.isfinite(C[mask]), C[mask], np.inf).sum(axis=0)[adm]
+        return int(adm[int(np.argmin(col))])
+ 
+    cand_de_casa = np.empty(n, dtype=int)
+    for i in range(n):
+        una = np.zeros(n, dtype=bool)
+        una[i] = True
+        cand_de_casa[i] = _mejor(una)      # mejor candidato admisible de cada casa
+ 
+    centros = [_mejor(np.ones(n, dtype=bool))]
     while len(centros) < k:
-        dmin = np.min(D[:, centros], axis=1)
-        w = np.nan_to_num(potencias * dmin ** 2, posinf=0.0, nan=0.0)
+        cmin = np.min(C[:, centros], axis=1)
+        w = np.nan_to_num(cmin ** 2, posinf=0.0, nan=0.0)
         i = int(rng.choice(n, p=w / w.sum())) if w.sum() > 0 else int(rng.integers(n))
-        cand = int(nodo_de_casa[i])
+        cand = int(cand_de_casa[i])
         if cand in centros:
-            cand = int(rng.integers(m))
+            libres = [c for c in global_adm if c not in centros]
+            cand = int(rng.choice(libres)) if libres else int(rng.integers(m))
         centros.append(cand)
  
     mejor = None
@@ -350,15 +549,13 @@ def _resolver_k(D, C, carga_sim, cap, k, potencias, max_iter):
         if mejor is None or coste < mejor[2] - 1e-6:
             mejor = (labels.copy(), list(centros), coste)
  
-        # 1-mediana discreta por cluster sobre TODOS los nodos de calle
         nuevos = []
         for j in range(k):
             mask = labels == j
             if not mask.any():
                 nuevos.append(centros[j])
                 continue
-            col = np.where(np.isfinite(C[mask]), C[mask], np.inf).sum(axis=0)
-            nuevos.append(int(np.argmin(col)))
+            nuevos.append(_mejor(mask))
         if nuevos == centros:
             break
         centros = nuevos
@@ -366,35 +563,65 @@ def _resolver_k(D, C, carga_sim, cap, k, potencias, max_iter):
     return mejor
  
  
-def _informe(labels, potencias, carga_sim, D, idx_cts, coste, centros, verbose):
+def _longitudes_reales(G, nodos_casa, nodos_ct, labels):
+    """Longitud real (m) de cada linea por el camino elegido, y % por secundaria."""
+    largos = np.zeros(len(nodos_casa))
+    sec = np.zeros(len(nodos_casa))
+    caches = {}
+    for j, nct in enumerate(nodos_ct):
+        caches[j] = nx.single_source_dijkstra_path(G, nct, weight="coste")
+    for i, nc in enumerate(nodos_casa):
+        camino = caches[int(labels[i])].get(nc)
+        if not camino:
+            largos[i] = np.inf
+            continue
+        L = Ls = 0.0
+        for u, v in zip(camino[:-1], camino[1:]):
+            d = G[u][v]
+            L += d["weight"]
+            if d.get("tipo") == "calle" and not d.get("principal", True):
+                Ls += d["weight"]
+        largos[i], sec[i] = L, Ls
+    return largos, sec
+ 
+ 
+def _informe(labels, potencias, carga_sim, largos, sec, coste_pen, centros,
+             nodos_ct, G, verbose):
     filas = []
-    for j in range(len(idx_cts)):
+    momento_real = float((largos * potencias).sum())
+    for j in range(len(centros)):
         mask = labels == j
         sim = float(carga_sim[mask].sum())
         nominal = next((p for p in POT_CTS if p >= sim), POT_CTS[-1])
-        momento = float((D[mask, idx_cts[j]] * potencias[mask]).sum())
         filas.append({
             "ct": j + 1,
             "parcelas": int(mask.sum()),
             "x": float(centros[j][0]),
             "y": float(centros[j][1]),
+            "en_calle_principal": bool(G.nodes[nodos_ct[j]].get("principal", True)),
             "pot_instalada_kW": float(potencias[mask].sum()),
             "carga_simultanea_kVA": sim,
             "ct_normalizado_kVA": nominal,
             "utilizacion": sim / nominal if nominal else 0.0,
-            "momento_kWm": momento,
-            "long_media_m": float(D[mask, idx_cts[j]].mean()) if mask.any() else 0.0,
-            "long_max_m": float(D[mask, idx_cts[j]].max()) if mask.any() else 0.0,
+            "momento_real_kWm": float((largos[mask] * potencias[mask]).sum()),
+            "long_media_m": float(largos[mask].mean()) if mask.any() else 0.0,
+            "long_max_m": float(largos[mask].max()) if mask.any() else 0.0,
+            "pct_secundaria": float(100 * sec[mask].sum() / max(largos[mask].sum(), 1e-9)),
         })
     if verbose:
-        print("\n--- CT sobre red vial | objetivo SUM P*d_red ---")
+        print("\n--- CT en parcela | objetivo SUM P*longitud penalizada ---")
         for f in filas:
-            print(f"CT {f['ct']}: {f['parcelas']:3d} parcelas | X={f['x']:.2f} Y={f['y']:.2f} | "
+            print(f"CT {f['ct']}: {f['parcelas']:3d} parcelas | X={f['x']:.2f} Y={f['y']:.2f} "
+                  f"({'principal' if f['en_calle_principal'] else 'secundaria'}) | "
                   f"{f['carga_simultanea_kVA']:7.1f} kVA -> CT {f['ct_normalizado_kVA']:.0f} "
-                  f"({f['utilizacion']*100:.0f}%) | momento {f['momento_kWm']:.0f} kW.m | "
-                  f"L media {f['long_media_m']:.0f} m / max {f['long_max_m']:.0f} m")
-        print(f"\nMomento total: {coste:.2f} kW.m")
-    return {"ct": filas, "momento_total_kWm": float(coste)}
+                  f"({f['utilizacion']*100:.0f}%) | momento real {f['momento_real_kWm']:.0f} kW.m | "
+                  f"L media {f['long_media_m']:.0f} m / max {f['long_max_m']:.0f} m | "
+                  f"{f['pct_secundaria']:.0f}% por calle secundaria")
+        print(f"\nMomento real total : {momento_real:.2f} kW.m")
+        print(f"Momento penalizado : {coste_pen:.2f} (funcion objetivo)")
+    return {"ct": filas, "momento_real_kWm": momento_real,
+            "momento_penalizado": float(coste_pen),
+            "pct_longitud_secundaria": float(100 * sec.sum() / max(largos.sum(), 1e-9))}
  
  
 # ---------------------------------------------------------------------------
@@ -402,49 +629,56 @@ def _informe(labels, potencias, carga_sim, D, idx_cts, coste, centros, verbose):
 # ---------------------------------------------------------------------------
  
 def plot_graph(potencias, positions, parcelas, centros, labels, calles, G,
-               nodos_casa, nodos_ct, ruta=None):
+               nodos_casa, nodos_ct, calles_principales=None, ruta=None,
+               titulo="CT en parcela - viario principal priorizado"):
+    import matplotlib
     if ruta:
         matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
  
     fig, ax = plt.subplots(figsize=(12, 12))
     cmap = plt.get_cmap("tab10")
  
-    for calle in calles:
+    for idx, calle in enumerate(calles):
+        pr = True if calles_principales is None else calles_principales[idx]
         x, y = calle.xy
-        ax.plot(x, y, color="gray", linewidth=1.5, alpha=0.4, zorder=1)
+        ax.plot(x, y, color="dimgray" if pr else "lightgray",
+                linewidth=4.0 if pr else 1.5, alpha=0.6, zorder=1,
+                solid_capstyle="round")
     for parcela in parcelas or []:
-        x, y = parcela.xy
-        ax.plot(x, y, color="red", linewidth=1.0, alpha=0.4, zorder=1)
+        x, y = (parcela.exterior.xy if hasattr(parcela, "exterior") else parcela.xy)
+        ax.plot(x, y, color="indianred", linewidth=1.0, alpha=0.5, zorder=1)
  
-    for i, (pos, pot, lab) in enumerate(zip(positions, potencias, labels)):
+    for i, (pos, lab) in enumerate(zip(positions, labels)):
         color = cmap(int(lab) % 10)
         try:
-            camino = nx.shortest_path(G, nodos_casa[i], nodos_ct[int(lab)], weight="weight")
+            camino = nx.shortest_path(G, nodos_casa[i], nodos_ct[int(lab)], weight="coste")
             xy = np.array([G.nodes[n]["pos"] for n in camino], dtype=float)
             ax.plot(xy[:, 0], xy[:, 1], color=color, linewidth=2, alpha=0.85, zorder=3)
-        except (nx.NetworkXNoPath, KeyError):
+        except (nx.NetworkXNoPath, nx.NodeNotFound, KeyError):
             ax.plot([pos[0], centros[int(lab)][0]], [pos[1], centros[int(lab)][1]],
                     color=color, linestyle="--", linewidth=1.2, alpha=0.4, zorder=2)
         ax.scatter(pos[0], pos[1], marker="x", color=color, s=40, zorder=4)
-        ax.annotate(f"{pot} kW", (pos[0], pos[1]), textcoords="offset points", 
-                    xytext=(0,10), ha='center', fontsize=8, color=color, weight='bold')
  
+    pot = np.asarray(potencias, dtype=float)
+    lab_arr = np.asarray(labels)
     for j, centro in enumerate(centros):
         color = cmap(j % 10)
-        sim = float(np.array(potencias)[np.array(labels) == j].sum()) * KS / COS_PHI
-        ax.scatter(centro[0], centro[1], marker="s", color=color, s=150,
+        sim = float(pot[lab_arr == j].sum()) * KS / COS_PHI
+        ax.scatter(centro[0], centro[1], marker="s", color=color, s=160,
                    edgecolor="black", linewidth=1.5, zorder=5)
         ax.annotate(f"CT {j+1}\n{sim:.0f} kVA", (centro[0], centro[1]),
-                    textcoords="offset points", xytext=(0, 12), ha="center",
+                    textcoords="offset points", xytext=(0, 13), ha="center",
                     fontsize=9, weight="bold",
                     bbox=dict(boxstyle="round,pad=0.3", fc="white", ec=color, alpha=0.9))
  
     ax.set_aspect("equal")
     ax.grid(True, linestyle="--", alpha=0.4)
-    plt.title("CT sobre red vial - minimizacion de SUM P*d", weight="bold")
+    plt.title(titulo, weight="bold")
     plt.tight_layout()
     if ruta:
         plt.savefig(ruta, dpi=110)
+        plt.close(fig)
     else:
         plt.show()
     return ruta
