@@ -12,5 +12,5 @@ selected_rows = df[df['Capa'].isin(capas_validas)]
 potencias, positions = get_power(selected_rows)
 parcelas = get_parcelas(selected_rows)
 calles = get_calles(df[df['Capa'] == "Calles"])
-centros_cts, labels, potencia_total_grupo, grafo_final = place_CTs(potencias, positions, parcelas, calles)
-plot_graph(potencias, positions, parcelas, centros_cts, labels, calles, grafo_final)
+centros, labels, resumen, G, nodos_casa, nodos_ct = place_CTs(potencias, positions, parcelas, calles)
+plot_graph(potencias, positions, parcelas, centros, labels, calles, G, nodos_casa, nodos_ct, ruta="grafo.png")
